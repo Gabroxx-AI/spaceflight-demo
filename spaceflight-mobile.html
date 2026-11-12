@@ -1,0 +1,1524 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>宇宙飛行デモ</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  html,body{touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
+  canvas{display:block;position:fixed;inset:0;width:100vw;height:100vh;cursor:none;touch-action:none}
+  #touch-controls{display:none;position:fixed;inset:0;z-index:5;pointer-events:none;font:600 13px/1 system-ui,sans-serif;color:#fff;touch-action:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+  .cluster{position:absolute;bottom:max(14px,env(safe-area-inset-bottom));display:grid;gap:8px;pointer-events:auto}
+  .left-cluster{left:max(12px,env(safe-area-inset-left));grid-template-columns:repeat(3,minmax(52px,min(13vw,76px)));grid-template-rows:minmax(54px,min(16vw,72px))}
+  .right-cluster{right:max(12px,env(safe-area-inset-right));grid-template-columns:repeat(2,minmax(58px,min(18vw,82px)));grid-template-rows:repeat(2,minmax(54px,min(16vw,72px)))}
+  #minimap{position:fixed;left:max(12px,env(safe-area-inset-left));bottom:max(14px,env(safe-area-inset-bottom));width:210px;height:auto;aspect-ratio:156/104;z-index:6;border:1px solid #7c879f;border-radius:10px;background:rgba(3,7,16,.82);box-shadow:0 2px 10px #0009;pointer-events:none}
+  .touch-btn{border:1px solid rgba(200,220,255,.45);border-radius:15px;background:rgba(20,28,48,.72);color:#f4f7ff;text-shadow:0 1px 2px #000;box-shadow:0 2px 10px #0008;display:flex;align-items:center;justify-content:center;text-align:center;touch-action:none;-webkit-tap-highlight-color:transparent;user-select:none}
+  .touch-btn.active{background:rgba(55,112,210,.88);border-color:#a9d5ff;transform:scale(.96)}
+  .turn-left{grid-column:1;grid-row:1}.reverse{grid-column:2;grid-row:1}.turn-right{grid-column:3;grid-row:1}
+  .boost{grid-column:1;grid-row:1;color:#ffd09b}.fire{grid-column:2;grid-row:1}.thrust{grid-column:1 / 3;grid-row:2}
+  @media (pointer:coarse), (max-width:700px){#touch-controls{display:block}#minimap{left:max(12px,env(safe-area-inset-left));bottom:calc(max(14px,env(safe-area-inset-bottom)) + min(16vw,72px) + 14px);width:min(156px,40vw)}}
+  @media (max-width:380px){.cluster{gap:6px}.left-cluster{grid-template-columns:repeat(3,52px);grid-template-rows:54px}.right-cluster{grid-template-columns:repeat(2,58px);grid-template-rows:repeat(2,54px)}.touch-btn{font-size:11px}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="minimap" width="312" height="208" aria-label="周辺ミニマップ"></canvas>
+<div id="touch-controls" aria-label="タッチ操作">
+  <div class="cluster left-cluster">
+    <button class="touch-btn turn-left" data-code="ArrowLeft">◀<br>左旋回</button>
+    <button class="touch-btn reverse" data-code="ArrowDown">▼<br>逆噴射</button>
+    <button class="touch-btn turn-right" data-code="ArrowRight">▶<br>右旋回</button>
+  </div>
+  <div class="cluster right-cluster">
+    <button class="touch-btn boost" data-code="ShiftLeft" data-edge="true">⚡<br>ブースト</button>
+    <button class="touch-btn fire" data-code="Space">◎<br>ショット</button>
+    <button class="touch-btn thrust" data-code="ArrowUp">▲ 加速</button>
+  </div>
+</div>
+<script>
+'use strict';
+
+// ===== 調整用の数値 =====
+const VIEW_W = 2800, VIEW_H = 1400; // 見える範囲
+const DOT = 3;                      // ドット1粒の大きさ（2800×1400 基準）
+const TURN_SPEED = 3.6;             // 旋回 (rad/秒)
+const TURN_ENERGY_COST = 8;          // 旋回中のエネルギー消費（毎秒）
+const THRUST = 300;                 // 加速（緩やかに上がる）
+const REVERSE = 220;                // 逆噴射
+const MAX_SPEED = 5000;             // 最高速度
+const THRUST_COST = 50;             // 噴射中の毎秒の消費（加速・逆噴射）
+const BOOST_ACCEL = 3;              // ブースト段階ごとの加速倍率（3倍、6倍、9倍）
+const BOOST_TIME = 2.5;             // ブースト1回の長さ（秒）
+const BOOST_CHARGES = 3;            // ブーストの回数
+const BOOST_RECHARGE = 20;          // 1回分が戻るまでの秒数
+const OVERSPEED_DECAY = 250;        // ブースト後、最高速度まで落ちていく速さ（毎秒）
+const BOLT_SPEED = 1400;            // 砲弾の初速（ここに自機の速度が足される）
+const BOLT_LIFE = 1.4;              // 砲弾の寿命（秒）
+const FIRE_INTERVAL = 0.14;         // 連射間隔（秒）
+const DIRECTIONS = 40;              // 機体の向きの段階数
+const ROCK_COUNT = 56;              // 自機のまわりに漂う岩の数（従来から約2割減）
+const ROCK_AREA = 3600;             // 岩を置く範囲（自機から上下左右この距離まで）
+const ENERGY_MAX = 1000;            // エネルギーの最大値
+const ENERGY_REGEN = 100;           // 毎秒の回復量
+const SHOT_COST = 30;               // ショット1発の消費
+const BARRIER_COST = 40;            // オートバリア発動の基本消費
+const IMPACT_DAMAGE = 0.001;        // 衝突エネルギー(½×換算質量×速さ²)を消費量に直す倍率
+const BOUNCE = 0.95;                // 反発係数（1 で完全なビリヤード）
+const SHIP_RADIUS = 18;             // 自機の当たり判定
+const SHIP_MASS = 1;                // 自機の重さ（岩はこれとの比で決まる）
+const ROCK_CRUSH = 40000;           // 岩同士：衝突エネルギー÷これ＝軽いほうの岩が受けるダメージ（弾1発＝1）
+const ROCK_CRUSH_MIN_SPEED = 150;   // これより遅くぶつかってもダメージなし（漂っている岩同士の接触）
+const UFO_POINTS = 30;              // UFO を倒したときの点（ショットでも体当たりでも）
+const UFO_WAIT_MIN = 15, UFO_WAIT_MAX = 30; // UFO が次に出てくるまでの秒数
+const UFO_SPEED = 220;              // UFO の進む速さ
+const UFO_WOBBLE = 140;             // ゆらゆらの振れ幅
+const UFO_BOOST = 1.5;              // UFO に体当たりしたときの自機の速度の倍率
+const UFO_RADIUS = 7 * DOT;         // UFO の当たり判定
+const BLAST_RADIUS = 500;           // UFO の爆風が届く範囲
+const BLAST_PUSH = 1400;            // 爆風の中心で受ける加速（端に行くほど弱まって0）
+
+const TAU = Math.PI * 2;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let cw = 0, ch = 0, scale = 1, D = 1;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cw = canvas.width = Math.round(innerWidth * dpr);
+  ch = canvas.height = Math.round(innerHeight * dpr);
+  scale = Math.min(cw / VIEW_W, ch / VIEW_H) || 1;
+  D = Math.max(1, Math.round(DOT * scale));
+  ctx.imageSmoothingEnabled = false;
+}
+addEventListener('resize', resize);
+resize();
+
+// ===== 自機のドット絵（上向きで描いて、各方向へ回転して用意する） =====
+const ART = [
+  '.......W.......',
+  '.......W.......',
+  '......WGW......',
+  '......WGW......',
+  '.....WGBGW.....',
+  '.....WGCGW.....',
+  '.....WGBGW.....',
+  '..R..WGGGW..R..',
+  '..G.WWGGGWW.G..',
+  '..G.WGGGGGW.G..',
+  '.WGWGGDGDGGWGW.',
+  '.WGGGGDGDGGGGW.',
+  'WGGGGWDGDWGGGGW',
+  'WGGWW.DGD.WWGGW',
+  'WGW...GGG...WGW',
+  'RR....DRD....RR',
+  '......R.R......',
+];
+const PALETTE = { W:'#f2f2f2', G:'#9aa3b5', D:'#4a5268', B:'#2f6cff', C:'#7fe0ff', R:'#e02818' };
+const FRAME = 27, FRAME_C = 13, ART_CX = 7, ART_CY = 8;
+
+const frames = [];
+for (let i = 0; i < DIRECTIONS; i++) {
+  const th = i / DIRECTIONS * TAU + Math.PI / 2;
+  const cos = Math.cos(th), sin = Math.sin(th);
+  const c = document.createElement('canvas');
+  c.width = c.height = FRAME;
+  const g = c.getContext('2d');
+  for (let y = 0; y < FRAME; y++) for (let x = 0; x < FRAME; x++) {
+    const dx = x - FRAME_C, dy = y - FRAME_C;
+    const sx = Math.round(dx * cos + dy * sin) + ART_CX;
+    const sy = Math.round(-dx * sin + dy * cos) + ART_CY;
+    const col = ART[sy] && PALETTE[ART[sy][sx]];
+    if (col) { g.fillStyle = col; g.fillRect(x, y, 1, 1); }
+  }
+  frames.push(c);
+}
+
+// ===== 岩のドット絵（1つずつ形を変えて作る。光は左上から） =====
+const ROCK_PALETTES = [
+  ['#d2c4ae', '#a08c74', '#6e5c4a', '#43362b', '#251d17'], // 茶
+  ['#c8ccd2', '#949aa4', '#646a74', '#3e424a', '#212328'], // 灰
+  ['#d0b89c', '#a2826a', '#72543f', '#4a3427', '#2a1c15'], // 赤茶
+];
+const ROCK_SIZE = [0, 3, 4, 5, 6, 7.5, 9, 11]; // 耐久 1〜7 に対応するドット半径
+const ROCK_POINTS = [0, 1, 1, 5, 10, 10, 15, 25]; // ショットで壊したときの点
+
+function makeRockArt(artR, pal) {
+  const n = Math.ceil(artR * 1.3) * 2 + 3, c = (n - 1) / 2;
+  const bumps = [1, 2, 3].map(k => [k + 1, Math.random() * TAU, 0.06 + Math.random() * 0.1]);
+  const craters = [];
+  for (let i = 0; i < 1 + Math.floor(artR / 2.5); i++) {
+    const a = Math.random() * TAU, d = Math.random() * artR * 0.55;
+    craters.push([Math.cos(a) * d, Math.sin(a) * d, 0.8 + Math.random() * artR * 0.22]);
+  }
+  const radiusAt = a => artR * (1 + bumps.reduce((s, [k, ph, amp]) => s + Math.sin(a * k + ph) * amp, 0));
+  const inside = (x, y) => Math.hypot(x, y) <= radiusAt(Math.atan2(y, x));
+  const img = document.createElement('canvas'), white = document.createElement('canvas');
+  img.width = img.height = white.width = white.height = n;
+  const g = img.getContext('2d'), gw = white.getContext('2d');
+  gw.fillStyle = '#ffffff';
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const dx = x - c, dy = y - c;
+    if (!inside(dx, dy)) continue;
+    const edge = !inside(dx + 1, dy) || !inside(dx - 1, dy) || !inside(dx, dy + 1) || !inside(dx, dy - 1);
+    // 左上が明るく、右下が暗い
+    const light = (-dx - dy) / (artR * 1.5);
+    let shade = light > 0.45 ? 0 : light > 0.05 ? 1 : light > -0.45 ? 2 : 3;
+    for (const [cx, cy, cr] of craters) {
+      const d = Math.hypot(dx - cx, dy - cy);
+      if (d <= cr) shade = Math.min(4, shade + 1);
+      else if (d <= cr + 1 && dx - cx + dy - cy > 0) shade = Math.max(0, shade - 1); // くぼみの縁
+    }
+    if (edge) shade = Math.max(shade, 3);
+    g.fillStyle = pal[shade];
+    g.fillRect(x, y, 1, 1);
+    gw.fillRect(x, y, 1, 1);
+  }
+  return { img, white, center: c };
+}
+
+// ===== 入力 =====
+const keys = new Set();
+const pressed = new Set(); // このフレームで押されたキー
+const touchPointers = new Map();
+const touchCounts = new Map();
+addEventListener('keydown', e => {
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space','ShiftLeft','ShiftRight'].includes(e.code)) e.preventDefault();
+  if (!e.repeat) pressed.add(e.code);
+  keys.add(e.code);
+});
+addEventListener('keyup', e => keys.delete(e.code));
+function releaseTouch(pointerId) {
+  const code = touchPointers.get(pointerId);
+  if (!code) return;
+  touchPointers.delete(pointerId);
+  const count = (touchCounts.get(code) || 1) - 1;
+  if (count <= 0) { touchCounts.delete(code); keys.delete(code); }
+  else touchCounts.set(code, count);
+  document.querySelector(`[data-code="${code}"]`)?.classList.toggle('active', count > 0);
+}
+document.querySelectorAll('.touch-btn').forEach(button => {
+  button.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (touchPointers.has(e.pointerId)) return;
+    const code = button.dataset.code;
+    touchPointers.set(e.pointerId, code);
+    touchCounts.set(code, (touchCounts.get(code) || 0) + 1);
+    keys.add(code);
+    if (button.dataset.edge === 'true') pressed.add(code);
+    button.classList.add('active');
+    try { button.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  button.addEventListener('pointerup', e => { e.preventDefault(); releaseTouch(e.pointerId); });
+  button.addEventListener('pointercancel', e => releaseTouch(e.pointerId));
+  button.addEventListener('lostpointercapture', e => releaseTouch(e.pointerId));
+  button.addEventListener('contextmenu', e => e.preventDefault());
+});
+addEventListener('blur', () => { keys.clear(); pressed.clear(); touchPointers.clear(); touchCounts.clear(); document.querySelectorAll('.touch-btn').forEach(b => b.classList.remove('active')); });
+addEventListener('pagehide', () => { keys.clear(); touchPointers.clear(); touchCounts.clear(); });
+
+// ===== 状態 =====
+const ship = {
+  x: 0, y: 0, vx: 0, vy: 0, a: -Math.PI / 2, cool: 0, flash: 0,
+  thrust: false, reverse: false,
+  flame: 0, revFlame: 0,         // 炎の大きさ（0〜1。点火で育ち、離すと縮む）
+  flick: 1, flickTo: 1, sway: 0, swayTo: 0, flickT: 0, // 炎のゆらぎ
+  energy: ENERGY_MAX, energyTrail: ENERGY_MAX, trailWait: 0, // ゲージ（減った分を少し残して見せる）
+  barrier: 0, barrierAng: 0, shake: 0,
+  dead: 0, inv: 0, // 撃墜後の待ち時間 / 復活直後の無敵時間
+  boost: 0, boostLevel: 0, boostFlame: 0, boostCharges: BOOST_CHARGES, boostRecharge: 0,
+  shrink: 1,
+};
+const RESPAWN_TIME = 2.5, INVULNERABLE_TIME = 2;
+const bolts = [];
+const particles = [];
+const rocks = [];
+// 試験用の移動惑星。以前の衛星軌道半径を大気圏の境界として使う。
+const PLANET = { x: 0, y: -6500, vx: 36, vy: 0, radius: 500, mu: 72000000, color: '#4f9c68' };
+const ATMOSPHERE_RADIUS = 1050;
+const PLANET_INFLUENCE_RADIUS = ATMOSPHERE_RADIUS * 3;
+const PLANET_FULL_GRAVITY_RADIUS = 2200;
+const PLANETARY_SATELLITE_COUNT = 19;
+const REGULAR_ROCK_EXCLUSION_RADIUS = PLANET_INFLUENCE_RADIUS + 400;
+const MAP_RANGE = 5000; // ミニマップの電波検知範囲
+const BIOME_SIZE = 45000;
+const BIOME_REVEAL_DISTANCE = 6000;
+const BIOME_NAMES = { basic: '基本', planet: '惑星', small: '小岩', medium: '中岩', large: '大岩' };
+const BIOME_STORAGE_KEY = 'spaceflight-demo-biomes-v1';
+const biomeCells = new Map();
+let worldTime = 0;
+const minimap = document.getElementById('minimap');
+const minimapCtx = minimap.getContext('2d');
+window.demo = { ship, bolts, rocks, particles, keys, PLANET, biomeCells };
+
+function biomeCellAt(x, y) {
+  return [Math.floor((x + BIOME_SIZE / 2) / BIOME_SIZE), Math.floor((y + 3250) / BIOME_SIZE)];
+}
+
+function persistBiomeCells() {
+  try { localStorage.setItem(BIOME_STORAGE_KEY, JSON.stringify(Object.fromEntries(biomeCells))); }
+  catch (_) { /* local files may not allow browser storage; the current session still remembers cells */ }
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(BIOME_STORAGE_KEY) || '{}');
+  for (const [key, type] of Object.entries(saved)) {
+    if (['basic', 'planet', 'small', 'medium', 'large'].includes(type)) biomeCells.set(key, type);
+  }
+} catch (_) { /* start with a fresh map */ }
+biomeCells.set('0,0', 'basic');
+const [planetCellX, planetCellY] = biomeCellAt(PLANET.x, PLANET.y);
+biomeCells.set(`${planetCellX},${planetCellY}`, 'planet');
+persistBiomeCells();
+
+function randomBiomeType() {
+  const roll = Math.random();
+  return roll < 0.4 ? 'basic' : roll < 0.6 ? 'small' : roll < 0.8 ? 'medium' : 'large';
+}
+
+function biomeAt(x, y) {
+  const [cx, cy] = biomeCellAt(x, y), key = `${cx},${cy}`;
+  if (!biomeCells.has(key)) {
+    biomeCells.set(key, randomBiomeType());
+    persistBiomeCells();
+  }
+  return biomeCells.get(key);
+}
+
+function revealNearbyBiomes() {
+  const [cx, cy] = biomeCellAt(ship.x, ship.y);
+  const left = cx * BIOME_SIZE - BIOME_SIZE / 2;
+  const right = left + BIOME_SIZE;
+  const top = cy * BIOME_SIZE - 3250;
+  const bottom = top + BIOME_SIZE;
+  if (ship.x - left < BIOME_REVEAL_DISTANCE) biomeAt(left - 1, ship.y);
+  if (right - ship.x < BIOME_REVEAL_DISTANCE) biomeAt(right + 1, ship.y);
+  if (ship.y - top < BIOME_REVEAL_DISTANCE) biomeAt(ship.x, top - 1);
+  if (bottom - ship.y < BIOME_REVEAL_DISTANCE) biomeAt(ship.x, bottom + 1);
+}
+
+function rockHpForBiome(type) {
+  const rareRoll = Math.random();
+  if ((type === 'basic' || type === 'large') && rareRoll < 0.004) return rareRoll < 0.001 ? 7 : 6;
+  if (type === 'planet') return 1;
+  if (type === 'small') return 1 + Math.floor(Math.random() * 2);
+  if (type === 'medium') return 1 + Math.floor(Math.random() * 4);
+  if (type === 'large') return 4 + Math.floor(Math.random() * 2);
+  return 1 + Math.floor(Math.random() * 5); // basic
+}
+
+function updateCelestialBodies(dt) {
+  worldTime += dt;
+  PLANET.x += PLANET.vx * dt;
+  PLANET.y += PLANET.vy * dt;
+}
+
+function planetaryGravityAt(x, y, planetX = PLANET.x, planetY = PLANET.y) {
+  const dx = planetX - x, dy = planetY - y;
+  const d2 = dx * dx + dy * dy, distance = Math.sqrt(d2);
+  if (distance >= PLANET_INFLUENCE_RADIUS) return [0, 0];
+  const t = Math.max(0, Math.min(1, (PLANET_INFLUENCE_RADIUS - distance) /
+    (PLANET_INFLUENCE_RADIUS - PLANET_FULL_GRAVITY_RADIUS)));
+  const influence = t * t * (3 - 2 * t);
+  const soft = Math.max(d2, Math.pow(PLANET.radius * 0.7, 2));
+  const accel = PLANET.mu / (soft * Math.sqrt(soft)) * influence;
+  return [dx * accel, dy * accel];
+}
+
+function applyGravity(body, dt) {
+  const [ax, ay] = planetaryGravityAt(body.x, body.y);
+  body.vx += ax * dt;
+  body.vy += ay * dt;
+}
+
+function atmosphereDepth(x, y) {
+  const distance = Math.hypot(x - PLANET.x, y - PLANET.y);
+  return Math.max(0, Math.min(1, (ATMOSPHERE_RADIUS - distance) /
+    (ATMOSPHERE_RADIUS - PLANET.radius)));
+}
+
+function shrinkAtDistance(baseRadius, distance) {
+  const resistance = Math.max(1, baseRadius / 12);
+  const shrinkStart = PLANET.radius + (ATMOSPHERE_RADIUS - PLANET.radius) / resistance;
+  if (distance >= shrinkStart) return 1;
+  const progress = Math.max(0, Math.min(1, (shrinkStart - distance) /
+    (shrinkStart - PLANET.radius)));
+  return 1 - progress * 0.96;
+}
+updateCelestialBodies(0);
+
+const STAR_TILE = 4096;
+function makeStars(n, parallax, color) {
+  const pts = [];
+  for (let i = 0; i < n; i++) pts.push([Math.random() * STAR_TILE, Math.random() * STAR_TILE]);
+  return { pts, parallax, color };
+}
+const starLayers = [makeStars(170, 0.55, '#343848'), makeStars(90, 1, '#7a8098'), makeStars(14, 1, '#d8dcec')];
+
+// ===== 岩 =====
+function viewHalf() { return [cw / 2 / scale, ch / 2 / scale]; }
+
+function spawnRock(initial) {
+  const [hw, hh] = viewHalf();
+  let x, y, valid = false;
+  for (let tries = 0; tries < 100; tries++) {
+    x = (Math.random() * 2 - 1) * ROCK_AREA;
+    y = (Math.random() * 2 - 1) * ROCK_AREA;
+    // 最初は自機のすぐそば以外、その後は画面の外にだけ出す
+    const outsideView = Math.abs(x) > hw + 80 || Math.abs(y) > hh + 80;
+    const outsidePlanetBiome = Math.hypot(ship.x + x - PLANET.x, ship.y + y - PLANET.y) > REGULAR_ROCK_EXCLUSION_RADIUS;
+    if ((initial ? Math.hypot(x, y) > 250 : outsideView) && outsidePlanetBiome) { valid = true; break; }
+  }
+  if (!valid) return;
+  const worldX = ship.x + x, worldY = ship.y + y;
+  const hp = rockHpForBiome(biomeAt(worldX, worldY));
+  const artR = ROCK_SIZE[hp];
+  const pal = ROCK_PALETTES[Math.floor(Math.random() * ROCK_PALETTES.length)];
+  const art = makeRockArt(artR, pal);
+  const dir = Math.random() * TAU, speed = 15 + Math.random() * (75 - hp * 10);
+  const baseRadius = artR * DOT, baseMass = Math.pow(artR * DOT / 15, 3);
+  rocks.push({
+    x: worldX, y: worldY, vx: Math.cos(dir) * speed, vy: Math.sin(dir) * speed,
+    r: baseRadius, m: baseMass, baseRadius, baseMass, shrink: 1, heatTrail: 0,
+    hp, pal, art, flash: 0, // 重さは体積に比例
+    points: ROCK_POINTS[hp],
+  });
+}
+
+function spawnPlanetarySatellites() {
+  for (let i = 0; i < PLANETARY_SATELLITE_COUNT; i++) {
+    const angle = i / PLANETARY_SATELLITE_COUNT * TAU + (Math.random() - 0.5) * 0.12;
+    const orbitRadius = 1300 + Math.random() * 850;
+    const x = PLANET.x + Math.cos(angle) * orbitRadius;
+    const y = PLANET.y + Math.sin(angle) * orbitRadius;
+    const [ax, ay] = planetaryGravityAt(x, y);
+    const orbitSpeed = Math.sqrt(Math.hypot(ax, ay) * orbitRadius);
+    const hp = 1, artR = ROCK_SIZE[hp];
+    const pal = ROCK_PALETTES[Math.floor(Math.random() * ROCK_PALETTES.length)];
+    const art = makeRockArt(artR, pal);
+    const baseRadius = artR * DOT, baseMass = Math.pow(artR * DOT / 15, 3);
+    rocks.push({
+      x, y,
+      vx: PLANET.vx - Math.sin(angle) * orbitSpeed,
+      vy: PLANET.vy + Math.cos(angle) * orbitSpeed,
+      r: baseRadius, m: baseMass, baseRadius, baseMass, shrink: 1, heatTrail: 0,
+      hp, pal, art, flash: 0, points: ROCK_POINTS[hp], planetarySatellite: true,
+    });
+  }
+}
+
+let activeSpeedRock = null;
+let speedRockWait = 35 + Math.random() * 20;
+
+function spawnSpeedRock() {
+  let angle, x, y, safe = false;
+  for (let i = 0; i < 30; i++) {
+    angle = Math.random() * TAU;
+    const distance = MAP_RANGE * (0.55 + Math.random() * 0.2);
+    x = ship.x + Math.cos(angle) * distance;
+    y = ship.y + Math.sin(angle) * distance;
+    if (biomeAt(x, y) !== 'planet' &&
+        Math.hypot(x - PLANET.x, y - PLANET.y) > REGULAR_ROCK_EXCLUSION_RADIUS) { safe = true; break; }
+  }
+  if (!safe) return null;
+  const artR = 15, hp = 5, pal = ROCK_PALETTES[Math.floor(Math.random() * ROCK_PALETTES.length)];
+  const art = makeRockArt(artR, pal), baseRadius = artR * DOT, baseMass = Math.pow(baseRadius / 15, 3);
+  const eventRock = {
+    x, y, vx: Math.cos(angle) * 1400, vy: Math.sin(angle) * 1400,
+    r: baseRadius, m: baseMass, baseRadius, baseMass, shrink: 1, heatTrail: 0,
+    hp, pal, art, flash: 0, points: 100, eventRock: true, eventLife: 60,
+  };
+  rocks.push(eventRock);
+  return eventRock;
+}
+
+function updateSpeedRockEvent(dt) {
+  if (activeSpeedRock) {
+    activeSpeedRock.eventLife -= dt;
+    if (activeSpeedRock.hp <= 0 || activeSpeedRock.eventLife <= 0) {
+      if (activeSpeedRock.hp > 0) {
+        burst(activeSpeedRock.x, activeSpeedRock.y, activeSpeedRock.vx, activeSpeedRock.vy,
+          18, ['#fff2a8', '#ff9b35', '#ed4628'], 25, 130, 0.2, 0.6, false);
+        activeSpeedRock.hp = 0;
+      }
+      activeSpeedRock = null;
+      speedRockWait = 90 + Math.random() * 60;
+    }
+    return;
+  }
+  speedRockWait -= dt;
+  if (speedRockWait <= 0) {
+    activeSpeedRock = spawnSpeedRock();
+    if (!activeSpeedRock) speedRockWait = 15;
+  }
+}
+
+for (let i = 0; i < ROCK_COUNT; i++) spawnRock(true);
+spawnPlanetarySatellites();
+
+function burst(x, y, vx, vy, count, colors, speedMin, speedMax, lifeMin, lifeMax, big) {
+  for (let i = 0; i < count && particles.length < 1500; i++) {
+    const a = Math.random() * TAU, v = speedMin + Math.random() * (speedMax - speedMin);
+    const life = lifeMin + Math.random() * (lifeMax - lifeMin);
+    particles.push({
+      x, y, vx: vx + Math.cos(a) * v, vy: vy + Math.sin(a) * v,
+      life, max: life, colors, size: big && Math.random() < 0.3 ? 2 : 1,
+    });
+  }
+}
+
+function shatter(r) {
+  const n = 10 + Math.round(r.r * 1.4);
+  burst(r.x, r.y, r.vx, r.vy, n, [r.pal[0], r.pal[1], r.pal[2], r.pal[3]], 40, 160 + r.r * 6, 0.5, 1.3, true);
+  burst(r.x, r.y, r.vx, r.vy, 6, ['#ffffff', '#ffe6a0', r.pal[1]], 80, 220, 0.12, 0.3, false);
+}
+
+// ===== UFO =====
+// たまに画面の外から現れ、自機の近くを横切るようにゆらゆら飛んでいく。1機ずつ
+const UFO_ART = [
+  '.....CCCCC.....',
+  '....CWCCCCC....',
+  '..GGGGGGGGGGG..',
+  '.GL.L.L.L.L.LG.',
+  'GGGGGGGGGGGGGGG',
+  '.DDDDDDDDDDDDD.',
+  '...DD.....DD...',
+];
+const UFO_COLORS = { C: '#7fe0ff', W: '#ffffff', G: '#b8bfcc', D: '#5a6070' };
+const UFO_LIGHTS = ['#ff3c3c', '#ffd23c', '#3cff6a', '#3cb4ff', '#c060ff'];
+const RAINBOW = ['#ff3030', '#ff9a20', '#ffe830', '#40f060', '#30c8ff', '#5060ff', '#c050ff'];
+let ufo = null;
+let ufoWait = UFO_WAIT_MIN + Math.random() * (UFO_WAIT_MAX - UFO_WAIT_MIN);
+
+function spawnUfo() {
+  const [hw, hh] = viewHalf();
+  // 画面の外の、ランダムな方向から出てくる
+  const from = Math.random() * TAU;
+  const dist = Math.hypot(hw, hh) + 150;
+  const sx = ship.x + Math.cos(from) * dist, sy = ship.y + Math.sin(from) * dist;
+  // 自機の近く（少しずらした点）へ向かって進む
+  const tx = ship.x + (Math.random() * 2 - 1) * hw * 0.5, ty = ship.y + (Math.random() * 2 - 1) * hh * 0.5;
+  const a = Math.atan2(ty - sy, tx - sx);
+  ufo = {
+    bx: sx, by: sy, x: sx, y: sy, vx: 0, vy: 0,
+    dirX: Math.cos(a), dirY: Math.sin(a), t: 0, phase: Math.random() * TAU,
+  };
+  [ufo.x, ufo.y] = ufoPos(ufo);
+}
+
+// 進む向きに対して横にゆらゆら、ときどき少し前後にもよれる
+function ufoPos(u) {
+  const side = Math.sin(u.t * 2.2 + u.phase) * UFO_WOBBLE + Math.sin(u.t * 5.3) * 18;
+  const fwd = Math.sin(u.t * 1.3 + u.phase) * 40;
+  return [u.bx - u.dirY * side + u.dirX * fwd, u.by + u.dirX * side + u.dirY * fwd];
+}
+
+function updateUfo(dt) {
+  if (!ufo) {
+    ufoWait -= dt;
+    if (ufoWait <= 0) spawnUfo();
+    return;
+  }
+  const u = ufo;
+  u.t += dt;
+  u.bx += u.dirX * UFO_SPEED * dt;
+  u.by += u.dirY * UFO_SPEED * dt;
+  const [nx, ny] = ufoPos(u);
+  u.vx = (nx - u.x) / dt; u.vy = (ny - u.y) / dt;
+  u.x = nx; u.y = ny;
+  // 通り過ぎて遠く離れたら消える
+  const [hw, hh] = viewHalf();
+  if (u.t > 5 && (Math.abs(u.x - ship.x) > hw + 600 || Math.abs(u.y - ship.y) > hh + 600)) removeUfo();
+}
+
+function removeUfo() {
+  ufo = null;
+  ufoWait = UFO_WAIT_MIN + Math.random() * (UFO_WAIT_MAX - UFO_WAIT_MIN);
+}
+
+// 虹色の爆発：粒ごとに色が虹の順に移り変わる
+function rainbowBurst(x, y, vx, vy, count, speedMin, speedMax, lifeMin, lifeMax) {
+  for (let i = 0; i < count && particles.length < 1500; i++) {
+    const a = Math.random() * TAU, v = speedMin + Math.random() * (speedMax - speedMin);
+    const life = lifeMin + Math.random() * (lifeMax - lifeMin);
+    const k = Math.floor(Math.random() * RAINBOW.length);
+    const colors = RAINBOW.slice(k).concat(RAINBOW.slice(0, k), RAINBOW.slice(k));
+    particles.push({
+      x, y, vx: vx + Math.cos(a) * v, vy: vy + Math.sin(a) * v,
+      life, max: life, colors, size: Math.random() < 0.4 ? 2 : 1,
+    });
+  }
+}
+
+const blasts = []; // 広がっていく爆風の輪（見た目だけ）
+
+// 爆風：範囲内の岩と自機を、爆発の中心から外向きに押し出す。近いほど強い。
+// 体当たりで爆発させたときも、自機は衝撃波の加速を受ける
+function blast(x, y, rammed) {
+  for (const r of rocks) {
+    const dx = r.x - x, dy = r.y - y, d = Math.hypot(dx, dy);
+    if (d >= BLAST_RADIUS + r.r || d < 1) continue;
+    const push = BLAST_PUSH * Math.min(1, 1 - (d - r.r) / BLAST_RADIUS);
+    r.vx += dx / d * push;
+    r.vy += dy / d * push;
+    r.touched = true; // 爆風で飛ばした岩も「自機がはじいた岩」としてスコアの対象
+  }
+  if (ship.dead <= 0) {
+    const dx = ship.x - x, dy = ship.y - y, d = Math.hypot(dx, dy);
+    if (d < BLAST_RADIUS) {
+      if (d >= 1) {
+        const push = BLAST_PUSH * (1 - d / BLAST_RADIUS);
+        ship.vx += dx / d * push;
+        ship.vy += dy / d * push;
+      } else if (rammed) {
+        const speed = Math.hypot(ship.vx, ship.vy);
+        const angle = speed > 1 ? Math.atan2(ship.vy, ship.vx) : ship.a;
+        ship.vx += Math.cos(angle) * BLAST_PUSH * 0.8;
+        ship.vy += Math.sin(angle) * BLAST_PUSH * 0.8;
+      }
+      // 最高速度を超えた分は少しずつ落ちていく
+      ship.overspeed = Math.max(ship.overspeed || 0, Math.hypot(ship.vx, ship.vy));
+      ship.shake = Math.max(ship.shake, 0.65 * (1 - d / BLAST_RADIUS));
+    }
+  }
+  blasts.push({ x, y, t: 0 });
+}
+
+function explodeUfo(rammed) {
+  const u = ufo;
+  blast(u.x, u.y, rammed);
+  rainbowBurst(u.x, u.y, u.vx * 0.3, u.vy * 0.3, 90, 60, 520, 0.6, 1.8);
+  rainbowBurst(u.x, u.y, u.vx * 0.3, u.vy * 0.3, 30, 20, 160, 0.3, 0.8);
+  burst(u.x, u.y, u.vx * 0.3, u.vy * 0.3, 10, ['#ffffff', '#ffffff', '#e8f8ff'], 100, 300, 0.1, 0.25, false);
+  score += UFO_POINTS;
+  scoreFlash = 0.4;
+  removeUfo();
+}
+
+// 自機の体当たり：反射もエネルギー消費もなく、今の速度が 1.5 倍になる
+function collideUfo() {
+  if (!ufo || ship.dead > 0) return;
+  if (Math.hypot(ufo.x - ship.x, ufo.y - ship.y) > SHIP_RADIUS + UFO_RADIUS) return;
+  ship.vx *= UFO_BOOST;
+  ship.vy *= UFO_BOOST;
+  // 最高速度を超えた分は、ブースト後と同じく少しずつ落ちていく
+  ship.overspeed = Math.hypot(ship.vx, ship.vy);
+  ship.shake = Math.max(ship.shake, 0.4);
+  explodeUfo(true);
+}
+
+// 爆風の輪：BLAST_TIME 秒で爆風の届く範囲まで広がって消える
+const BLAST_TIME = 0.4;
+function drawBlasts() {
+  for (const b of blasts) {
+    const p = Math.min(1, b.t / BLAST_TIME);
+    const rad = BLAST_RADIUS * (1 - (1 - p) * (1 - p)); // 最初に速く広がる
+    const n = Math.max(24, Math.round(rad * scale / D / 2.5));
+    const cx = screenX(b.x), cy = screenY(b.y);
+    for (let i = 0; i < n; i++) {
+      // 外側ほど薄くなるので、後半は点を間引く
+      if (p > 0.6 && (i + Math.floor(b.t * 40)) % 3 === 0) continue;
+      const a = i / n * TAU;
+      ctx.fillStyle = RAINBOW[(i + Math.floor(b.t * 30)) % RAINBOW.length];
+      ctx.fillRect(cx + snap(Math.cos(a) * rad * scale), cy + snap(Math.sin(a) * rad * scale), D, D);
+    }
+  }
+}
+
+function drawUfo(now) {
+  if (!ufo) return;
+  const [hw, hh] = viewHalf();
+  if (Math.abs(ufo.x - ship.x) > hw + 60 || Math.abs(ufo.y - ship.y) > hh + 60) return;
+  const left = screenX(ufo.x) - 7 * D, top = screenY(ufo.y) - 3 * D;
+  const step = Math.floor(now / 120);
+  let li = 0;
+  for (let y = 0; y < UFO_ART.length; y++) {
+    for (let x = 0; x < UFO_ART[y].length; x++) {
+      const c = UFO_ART[y][x];
+      if (c === '.') continue;
+      ctx.fillStyle = c === 'L' ? UFO_LIGHTS[(step + li++) % UFO_LIGHTS.length] : UFO_COLORS[c];
+      ctx.fillRect(left + x * D, top + y * D, D, D);
+    }
+  }
+}
+
+// 線分(px,py)→(x,y) と円の当たり（速い弾のすり抜け防止）
+function segHitsCircle(px, py, x, y, cx, cy, rad) {
+  const sx = x - px, sy = y - py;
+  const len2 = sx * sx + sy * sy || 1;
+  const t = Math.max(0, Math.min(1, ((cx - px) * sx + (cy - py) * sy) / len2));
+  const qx = px + sx * t - cx, qy = py + sy * t - cy;
+  return qx * qx + qy * qy <= rad * rad ? t : -1;
+}
+
+// ===== 更新 =====
+function heading() { // 絵と操作を一致させるため、向きは段階に丸めて使う
+  const step = TAU / DIRECTIONS;
+  return Math.round(ship.a / step) * step;
+}
+
+function update(dt) {
+  updateCelestialBodies(dt);
+  ship.inv -= dt;
+  if (ship.dead > 0) {
+    // 残骸と一緒に流れていく
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+    ship.dead -= dt;
+    if (ship.dead <= 0) respawn();
+  } else {
+    controlShip(dt);
+  }
+  updateWorld(dt);
+  revealNearbyBiomes();
+}
+
+function destroyShip() {
+  ship.dead = RESPAWN_TIME;
+  ship.energy = 0;
+  ship.flame = ship.revFlame = 0;
+  ship.boost = 0;
+  ship.boostLevel = 0;
+  ship.barrier = 0;
+  ship.shake = 1;
+  burst(ship.x, ship.y, ship.vx, ship.vy, 60, ['#ffffff', '#fff0b0', '#ffa040', '#ff2a18', '#a80e0e', '#401010'], 40, 420, 0.5, 1.6, true);
+  burst(ship.x, ship.y, ship.vx, ship.vy, 24, ['#f2f2f2', '#9aa3b5', '#4a5268'], 30, 260, 0.8, 2.0, true);
+  burst(ship.x, ship.y, ship.vx, ship.vy, 10, ['#7fe0ff', '#2f6cff'], 60, 200, 0.4, 1.0, false);
+}
+
+function respawn() {
+  ship.shrink = 1;
+  ship.vx = ship.vy = 0;
+  ship.energy = ship.energyTrail = ENERGY_MAX;
+  ship.inv = INVULNERABLE_TIME;
+  ship.cool = 0.3;
+  ship.boostCharges = BOOST_CHARGES;
+  ship.boostRecharge = 0;
+  ship.boost = ship.boostLevel = 0;
+}
+
+function controlShip(dt) {
+  let turningLeft = keys.has('ArrowLeft'), turningRight = keys.has('ArrowRight');
+  const turning = turningLeft || turningRight;
+  const propulsionInput = keys.has('ArrowUp') || keys.has('ArrowDown') || ship.boost > 0 ||
+    pressed.has('ShiftLeft') || pressed.has('ShiftRight');
+  if (!turning && !propulsionInput) ship.energy = Math.min(ENERGY_MAX, ship.energy + ENERGY_REGEN * dt);
+  if (turning) {
+    const turnCost = TURN_ENERGY_COST * dt;
+    if (ship.energy >= turnCost) {
+      if (turningLeft) ship.a -= TURN_SPEED * dt;
+      if (turningRight) ship.a += TURN_SPEED * dt;
+      spendEnergy(turnCost);
+    } else {
+      turningLeft = turningRight = false;
+    }
+  }
+  const a = heading(), dirX = Math.cos(a), dirY = Math.sin(a);
+
+  const planetDistance = Math.hypot(ship.x - PLANET.x, ship.y - PLANET.y);
+  ship.shrink = shrinkAtDistance(SHIP_RADIUS * 1.3, planetDistance);
+
+  // Shiftを押すたびにブーストを重ねる。継続時間は延長せず、加速倍率を3/6/9倍にする。
+  ship.boostRecharge = ship.boostCharges < BOOST_CHARGES ? ship.boostRecharge + dt : 0;
+  if (ship.boostRecharge >= BOOST_RECHARGE) { ship.boostCharges++; ship.boostRecharge = 0; }
+  if ((pressed.has('ShiftLeft') || pressed.has('ShiftRight')) && ship.boostCharges > 0 && ship.energy > 0 && ship.boostLevel < BOOST_CHARGES) {
+    ship.boostCharges--;
+    if (ship.boost <= 0) ship.boost = BOOST_TIME;
+    ship.boostLevel++;
+  }
+  ship.boost -= dt;
+  if (ship.boost <= 0) ship.boostLevel = 0;
+  let boosting = ship.boost > 0 && ship.boostLevel > 0;
+
+  let thrust = boosting || keys.has('ArrowUp');
+  let reverse = !boosting && keys.has('ArrowDown');
+  // 噴射にはエネルギーが要る。足りなければ噴射できない（ブーストも終わる）
+  const cost = ((thrust ? (boosting ? BOOST_ACCEL * ship.boostLevel : 1) : 0) + (reverse ? 1 : 0)) * THRUST_COST * dt;
+  if (cost > 0 && ship.energy < cost) {
+    thrust = reverse = boosting = false;
+    ship.boost = 0;
+    ship.boostLevel = 0;
+  } else if (cost > 0) {
+    spendEnergy(cost);
+  }
+  ship.thrust = thrust;
+  ship.reverse = reverse;
+  ship.boosting = boosting;
+
+  const accel = (thrust ? THRUST * (boosting ? BOOST_ACCEL * ship.boostLevel : 1) : 0) - (reverse ? REVERSE : 0);
+  const speedBeforeGravity = Math.hypot(ship.vx, ship.vy);
+  applyGravity(ship, dt);
+  const speedAfterGravity = Math.hypot(ship.vx, ship.vy);
+  if (Math.hypot(PLANET.x - ship.x, PLANET.y - ship.y) < PLANET_INFLUENCE_RADIUS * 2.2 && speedAfterGravity > speedBeforeGravity) {
+    // スイングバイで得た速度を残し、ブースト後と同じように少しずつ落とす。
+    ship.overspeed = Math.max(ship.overspeed || 0, speedAfterGravity + OVERSPEED_DECAY * dt);
+  }
+  const atmosphere = atmosphereDepth(ship.x, ship.y);
+  if (atmosphere > 0) {
+    const sizeFactor = 15 / (SHIP_RADIUS * 1.3);
+    const drag = (0.06 + 3.2 * atmosphere * atmosphere) * sizeFactor;
+    const retention = Math.exp(-drag * dt);
+    ship.vx = PLANET.vx + (ship.vx - PLANET.vx) * retention;
+    ship.vy = PLANET.vy + (ship.vy - PLANET.vy) * retention;
+  }
+  ship.vx += dirX * accel * dt;
+  ship.vy += dirY * accel * dt;
+
+  // 大気圏外は空気抵抗なし。最高速度だけ抑える。
+  // ブースト後や UFO に体当たりした後に最高速度を超えている分は、急に止めず少しずつ落とす
+  const sp = Math.hypot(ship.vx, ship.vy);
+  const cap = Math.max(MAX_SPEED, Math.min(ship.overspeed || 0, sp) - OVERSPEED_DECAY * dt);
+  ship.overspeed = cap;
+  if (sp > cap) { ship.vx *= cap / sp; ship.vy *= cap / sp; }
+  ship.prevX = ship.x; ship.prevY = ship.y;
+  ship.x += ship.vx * dt;
+  ship.y += ship.vy * dt;
+
+  // ろうそくの炎：点火で育ち、離すと縮む。ゆっくり揺れる
+  ship.flame = approach(ship.flame, ship.thrust ? 1 : 0, dt * (ship.thrust ? 9 : 6));
+  ship.revFlame = approach(ship.revFlame, ship.reverse ? 1 : 0, dt * (ship.reverse ? 10 : 7));
+  ship.boostFlame = approach(ship.boostFlame, ship.boosting ? 1 : 0, dt * (ship.boosting ? 8 : 3));
+  ship.flickT -= dt;
+  if (ship.flickT <= 0) {
+    ship.flickT = 0.05 + Math.random() * 0.07;
+    ship.flickTo = 0.8 + Math.random() * 0.35;
+    ship.swayTo = (Math.random() * 2 - 1) * 1.6;
+  }
+  ship.flick += (ship.flickTo - ship.flick) * Math.min(1, dt * 18);
+  ship.sway += (ship.swayTo - ship.sway) * Math.min(1, dt * 10);
+
+  // エネルギー砲：自機の速度をそのまま受け継ぐ
+  ship.cool -= dt;
+  ship.flash -= dt;
+  if (keys.has('Space') && ship.cool <= 0 && ship.energy >= SHOT_COST) {
+    ship.cool = FIRE_INTERVAL;
+    spendEnergy(SHOT_COST);
+    ship.flash = 0.05;
+    const nose = 9 * DOT;
+    bolts.push({
+      x: ship.x + dirX * nose, y: ship.y + dirY * nose,
+      vx: ship.vx + dirX * BOLT_SPEED, vy: ship.vy + dirY * BOLT_SPEED,
+      dirX, dirY, life: BOLT_LIFE,
+    });
+  }
+}
+
+function updateWorld(dt) {
+  for (const r of rocks) {
+    if (r.hp <= 0) continue;
+    r.prevX = r.x; r.prevY = r.y;
+    if (!r.planetarySatellite && r.hp > 1 &&
+        (Math.hypot(r.x - PLANET.x, r.y - PLANET.y) < PLANET_INFLUENCE_RADIUS || biomeAt(r.x, r.y) === 'planet')) {
+      shatter(r);
+      r.hp = 0;
+      continue;
+    }
+    applyGravity(r, dt);
+    updateRockAtmosphere(r, dt);
+    r.x += r.vx * dt; r.y += r.vy * dt; r.flash -= dt;
+  }
+  updateUfo(dt);
+  updateSpeedRockEvent(dt);
+  collideCelestialBodies();
+  collideRocks();
+  collideShip(dt);
+  collideUfo();
+  ship.barrier -= dt;
+  ship.shake = Math.max(0, ship.shake - dt * 3);
+  ship.trailWait -= dt;
+  if (ship.trailWait <= 0) ship.energyTrail = Math.max(ship.energy, ship.energyTrail - 600 * dt);
+  if (ship.energyTrail < ship.energy) ship.energyTrail = ship.energy;
+
+  for (const b of bolts) {
+    const px = b.x, py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    // UFO は1発で倒せる
+    if (ufo && segHitsCircle(px, py, b.x, b.y, ufo.x, ufo.y, UFO_RADIUS + DOT) >= 0) {
+      b.life = 0;
+      explodeUfo();
+      continue;
+    }
+    for (const r of rocks) {
+      if (r.hp <= 0) continue;
+      const t = segHitsCircle(px, py, b.x, b.y, r.x, r.y, r.r + DOT);
+      if (t < 0) continue;
+      const hx = px + (b.x - px) * t, hy = py + (b.y - py) * t;
+      b.life = 0;
+      r.hp--;
+      r.flash = 0.07;
+      // 当たった所から小さな欠片
+      burst(hx, hy, r.vx, r.vy, 5, ['#ffffff', r.pal[0], r.pal[1], r.pal[2]], 40, 170, 0.15, 0.4, false);
+      if (r.hp <= 0) {
+        shatter(r);
+        score += r.points;
+        scoreFlash = 0.3;
+      }
+      break;
+    }
+  }
+  removeDead(bolts, b => b.life <= 0);
+
+  // 壊れた岩と、遠く離れた岩は入れ替える
+  let missing = 0;
+  for (let i = rocks.length - 1; i >= 0; i--) {
+    const r = rocks[i];
+    const outsideLocalArea = Math.abs(r.x - ship.x) > ROCK_AREA + 400 || Math.abs(r.y - ship.y) > ROCK_AREA + 400;
+    if ((r.hp <= 0 || outsideLocalArea) && !(r.planetarySatellite && r.hp > 0) && !(r.eventRock && r.hp > 0)) {
+      rocks.splice(i, 1);
+      // 速度を記録した岩が消えたら、スコアは HIGH SCORE に残して0から
+      if (r === recordRock) {
+        recordRock = null;
+        score = 0;
+      }
+      if (!r.planetarySatellite && !r.eventRock) missing++;
+    }
+  }
+  for (let i = 0; i < missing; i++) spawnRock(false);
+  if (Math.hypot(ship.x - PLANET.x, ship.y - PLANET.y) > REGULAR_ROCK_EXCLUSION_RADIUS &&
+      rocks.filter(r => !r.planetarySatellite && !r.eventRock).length < ROCK_COUNT) spawnRock(false);
+
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  removeDead(particles, p => p.life <= 0);
+  for (const b of blasts) b.t += dt;
+  removeDead(blasts, b => b.t >= BLAST_TIME);
+  pickFastestRock();
+  updateCapture(dt);
+  highScore = Math.max(highScore, score);
+  scoreFlash -= dt;
+}
+
+function updateRockAtmosphere(r, dt) {
+  const distance = Math.hypot(r.x - PLANET.x, r.y - PLANET.y);
+  r.shrink = shrinkAtDistance(r.baseRadius, distance);
+  r.r = r.baseRadius * r.shrink;
+  r.m = Math.max(0.001, r.baseMass * r.shrink * r.shrink * r.shrink);
+  const depth = atmosphereDepth(r.x, r.y);
+  if (depth <= 0) { r.atmosphere = false; return; }
+  r.atmosphere = true;
+  const sizeFactor = 15 / Math.max(3, r.baseRadius);
+  const drag = (0.06 + 3.2 * depth * depth) * sizeFactor;
+  const retention = Math.exp(-drag * dt);
+  r.vx = PLANET.vx + (r.vx - PLANET.vx) * retention;
+  r.vy = PLANET.vy + (r.vy - PLANET.vy) * retention;
+  r.heatTrail -= dt;
+  if (r.heatTrail <= 0) {
+    r.heatTrail = 0.08;
+    burst(r.x, r.y, r.vx, r.vy, 2, ['#fff2a8', '#ff9b35', '#ed4628'], 15, 65, 0.12, 0.28, false);
+  }
+  if (r.shrink <= 0.04 || Math.hypot(r.x - PLANET.x, r.y - PLANET.y) <= PLANET.radius + r.r * 0.5) {
+    r.hp = 0;
+    burst(r.x, r.y, r.vx, r.vy, 12, ['#fff0b0', '#ff9b35', '#d74429', '#66535a'], 20, 120, 0.2, 0.6, false);
+  }
+}
+
+// スコア：
+// ・ショットで岩を壊すと 小1・中5・大10 点を足す
+// ・自機が（玉突きも含めて）はじいた最速の岩を画面内に CAPTURE_TIME 秒とらえ続けると、
+//   スコアはその岩の速度に置き換わる（その岩を記録の岩として覚える）。
+//   とらえている間にさらに速くなれば記録を伸ばす
+// ・記録の岩が消えたらスコアは0に戻る。それまでの最高は HIGH SCORE に残る
+const CAPTURE_TIME = 2;
+const TRACK_MIN_SPEED = 100;
+let score = 0, scoreFlash = 0, highScore = 0, recordRock = null;
+const capture = { rock: null, t: 0 };
+
+function onScreen(r) {
+  const [hw, hh] = viewHalf();
+  return Math.abs(r.x - ship.x) <= hw - r.r && Math.abs(r.y - ship.y) <= hh - r.r;
+}
+
+function updateCapture(dt) {
+  const r = trackedRock;
+  if (!r || !r.touched || r.hp <= 0 || ship.dead > 0 || !onScreen(r)) {
+    capture.rock = null;
+    capture.t = 0;
+    return;
+  }
+  if (capture.rock !== r) { capture.rock = r; capture.t = 0; }
+  const wasCaptured = capture.t >= CAPTURE_TIME;
+  capture.t += dt;
+  if (capture.t < CAPTURE_TIME) return;
+  const sp = rockSpeed(r);
+  if (!wasCaptured || recordRock !== r) {
+    // とらえ終わった瞬間：撃破点の合計も前の記録も、この岩の速度で上書き
+    recordRock = r;
+    score = sp;
+    scoreFlash = 0.6;
+  } else if (sp > score + 0.5) {
+    score = sp;
+    scoreFlash = 0.6;
+  }
+}
+
+// 範囲内で一番速い岩を選ぶ。ほぼ同じ速さで表示がちらつかないよう、
+// 今の岩より3%以上速い岩が出たときだけ切り替える
+let trackedRock = null;
+function rockSpeed(r) { return Math.hypot(r.vx, r.vy); }
+function pickFastestRock() {
+  let best = null, bestSpeed = -1;
+  for (const r of rocks) {
+    if (r.eventRock && Math.hypot(r.x - ship.x, r.y - ship.y) > MAP_RANGE) continue;
+    const sp = rockSpeed(r);
+    if (sp > bestSpeed) { best = r; bestSpeed = sp; }
+  }
+  if (trackedRock && trackedRock !== best && rocks.includes(trackedRock) &&
+      (!trackedRock.eventRock || Math.hypot(trackedRock.x - ship.x, trackedRock.y - ship.y) <= MAP_RANGE) &&
+      bestSpeed < rockSpeed(trackedRock) * 1.03) best = trackedRock;
+  // 速度 TRACK_MIN_SPEED 以下なら、表示も矢印も照準も出さない
+  trackedRock = best && rockSpeed(best) > TRACK_MIN_SPEED ? best : null;
+}
+
+function spendEnergy(n) {
+  if (ship.trailWait <= 0) ship.trailWait = 0.35;
+  ship.energy = Math.max(0, ship.energy - n);
+}
+
+// 2つの物体の衝突（ビリヤードと同じ考え方）。
+// ぶつかる強さ ＝ ½ × 換算質量 × (近づく速さ)²。換算質量 = m1×m2/(m1+m2)
+// 軽い小石なら小さく、重い物ほど自分の重さに近づき、動かない壁なら自分の重さそのもの
+function bounce(a, ma, b, mb, rad, e) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  const d2 = dx * dx + dy * dy;
+  if (d2 >= rad * rad) return null;
+  const d = Math.sqrt(d2) || 1, nx = dx / d, ny = dy / d;
+  const ia = 1 / ma, ib = 1 / mb, overlap = rad - d;
+  a.x += nx * overlap * ia / (ia + ib); a.y += ny * overlap * ia / (ia + ib);
+  b.x -= nx * overlap * ib / (ia + ib); b.y -= ny * overlap * ib / (ia + ib);
+  const vn = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+  if (vn >= 0) return null; // すでに離れていく途中
+  const mu = 1 / (ia + ib);
+  const j = -(1 + e) * vn * mu;
+  a.vx += j * ia * nx; a.vy += j * ia * ny;
+  b.vx -= j * ib * nx; b.vy -= j * ib * ny;
+  return { nx, ny, speed: -vn, impact: 0.5 * mu * vn * vn };
+}
+
+function collideRocks() {
+  for (let i = 0; i < rocks.length; i++) {
+    const a = rocks[i];
+    if (a.hp <= 0) continue;
+    for (let k = i + 1; k < rocks.length; k++) {
+      const b = rocks[k], rad = a.r + b.r;
+      if (b.hp <= 0) continue;
+      if (Math.abs(a.x - b.x) > rad || Math.abs(a.y - b.y) > rad) continue;
+      const hit = bounce(a, a.m, b, b.m, rad, BOUNCE);
+      if (!hit) continue;
+      // 自機がはじいた岩に当たった岩も、スコアの対象（玉突き）
+      if (a.touched || b.touched) a.touched = b.touched = true;
+      // 小さいほうの岩だけがダメージを受ける（同じ重さならどちらも無傷）
+      if (a.m === b.m || hit.speed < ROCK_CRUSH_MIN_SPEED) continue;
+      const small = a.m < b.m ? a : b;
+      crushRock(small, hit.impact / ROCK_CRUSH, b.x + hit.nx * b.r, b.y + hit.ny * b.r);
+      if (a.hp <= 0) break;
+    }
+  }
+}
+
+function crushRock(r, dmg, hx, hy) {
+  r.hp -= dmg;
+  r.flash = 0.07;
+  burst(hx, hy, r.vx, r.vy, 4 + Math.min(10, Math.round(dmg * 3)), ['#ffffff', r.pal[0], r.pal[1], r.pal[2]], 40, 200, 0.15, 0.45, false);
+  if (r.hp <= 0) shatter(r);
+}
+
+function collideShip(dt) {
+  if (ship.dead > 0 || ship.inv > 0) return; // 撃墜中と復活直後はすり抜ける
+  for (const r of rocks) {
+    if (r.hp <= 0) continue;
+    const rad = SHIP_RADIUS + r.r;
+    const endDx = ship.x - r.x, endDy = ship.y - r.y;
+    const overlaps = endDx * endDx + endDy * endDy < rad * rad;
+    let hitT = 1;
+    if (!overlaps) {
+      const sx = (ship.prevX ?? ship.x) - (r.prevX ?? r.x);
+      const sy = (ship.prevY ?? ship.y) - (r.prevY ?? r.y);
+      hitT = segHitsCircle(sx, sy, endDx, endDy, 0, 0, rad);
+      if (hitT < 0) continue;
+      // 高速時に岩をすり抜けないよう、接触位置で衝突を解決する。
+      const t = Math.max(0, Math.min(1, hitT + 0.001));
+      const shipStartX = ship.prevX ?? ship.x, shipStartY = ship.prevY ?? ship.y;
+      const rockStartX = r.prevX ?? r.x, rockStartY = r.prevY ?? r.y;
+      ship.x = shipStartX + (ship.x - shipStartX) * t;
+      ship.y = shipStartY + (ship.y - shipStartY) * t;
+      r.x = rockStartX + (r.x - rockStartX) * t;
+      r.y = rockStartY + (r.y - rockStartY) * t;
+    }
+    const hit = bounce(ship, SHIP_MASS, r, r.m, rad, BOUNCE);
+    if (!hit) continue;
+    r.touched = true;
+    // 押し付けているだけのような弱い接触では、基本消費を取らない
+    const base = hit.speed > 30 && ship.barrier <= 0 ? BARRIER_COST : 0;
+    const cost = base + hit.impact * IMPACT_DAMAGE;
+    const px = ship.x - hit.nx * SHIP_RADIUS, py = ship.y - hit.ny * SHIP_RADIUS;
+    if (ship.energy >= cost) {
+      spendEnergy(cost);
+      ship.barrier = 0.35;
+      ship.barrierAng = Math.atan2(-hit.ny, -hit.nx);
+      burst(px, py, ship.vx, ship.vy, 6 + Math.round(cost / 25), ['#ffffff', '#7ffcff', '#2a7cff'], 60, 260, 0.15, 0.45, false);
+    } else {
+      // エネルギー不足：バリアが張れずに撃墜
+      destroyShip();
+      return;
+    }
+    ship.shake = Math.min(1, Math.max(ship.shake, cost / 500));
+    if (!overlaps && ship.dead <= 0) {
+      const remain = Math.max(0, 1 - hitT) * dt;
+      ship.x += ship.vx * remain;
+      ship.y += ship.vy * remain;
+      r.x += r.vx * remain;
+      r.y += r.vy * remain;
+    }
+  }
+}
+
+function collideCelestialBodies() {
+  const bodies = [PLANET];
+  for (const celestial of bodies) {
+    for (const r of rocks) {
+      if (r.hp <= 0) continue;
+      const dx = r.x - celestial.x, dy = r.y - celestial.y;
+      const minDist = celestial.radius + r.r, d = Math.hypot(dx, dy);
+      if (d >= minDist) continue;
+      if (r.atmosphere) {
+        r.hp = 0;
+        burst(r.x, r.y, r.vx, r.vy, 12, ['#fff0b0', '#ff9b35', '#d74429', '#66535a'], 20, 120, 0.2, 0.6, false);
+        continue;
+      }
+      const nx = dx / (d || 1), ny = dy / (d || 1);
+      r.x = celestial.x + nx * minDist;
+      r.y = celestial.y + ny * minDist;
+      const vn = (r.vx - celestial.vx) * nx + (r.vy - celestial.vy) * ny;
+      if (vn < 0) { r.vx -= 1.65 * vn * nx; r.vy -= 1.65 * vn * ny; }
+      r.touched = true;
+    }
+    if (ship.dead > 0) continue;
+    const dx = ship.x - celestial.x, dy = ship.y - celestial.y;
+    const minDist = celestial.radius + SHIP_RADIUS, d = Math.hypot(dx, dy);
+    if (d >= minDist) continue;
+    const nx = dx / (d || 1), ny = dy / (d || 1);
+    ship.x = celestial.x + nx * minDist;
+    ship.y = celestial.y + ny * minDist;
+    const vn = (ship.vx - celestial.vx) * nx + (ship.vy - celestial.vy) * ny;
+    if (vn < 0) { ship.vx -= 1.7 * vn * nx; ship.vy -= 1.7 * vn * ny; }
+    ship.shake = Math.max(ship.shake, 0.6);
+    if (ship.inv <= 0) destroyShip();
+  }
+}
+
+function approach(v, target, step) { return v < target ? Math.min(target, v + step) : Math.max(target, v - step); }
+function removeDead(arr, dead) {
+  let j = 0;
+  for (let i = 0; i < arr.length; i++) if (!dead(arr[i])) arr[j++] = arr[i];
+  arr.length = j;
+}
+
+// ===== 描画 =====
+function snap(v) { return Math.round(v / D) * D; }
+function screenX(wx) { return snap(cw / 2 + (wx - ship.x) * scale); }
+function screenY(wy) { return snap(ch / 2 + (wy - ship.y) * scale); }
+
+function drawStars() {
+  const [hw, hh] = viewHalf();
+  for (const layer of starLayers) {
+    ctx.fillStyle = layer.color;
+    for (const [px, py] of layer.pts) {
+      const x = (((px - ship.x * layer.parallax) % STAR_TILE) + STAR_TILE) % STAR_TILE - STAR_TILE / 2;
+      const y = (((py - ship.y * layer.parallax) % STAR_TILE) + STAR_TILE) % STAR_TILE - STAR_TILE / 2;
+      if (Math.abs(x) > hw || Math.abs(y) > hh) continue;
+      ctx.fillRect(snap(cw / 2 + x * scale), snap(ch / 2 + y * scale), D, D);
+    }
+  }
+}
+
+function drawCelestialBodies() {
+  const [hw, hh] = viewHalf();
+  const visibleRadius = PLANET_INFLUENCE_RADIUS;
+  if (Math.abs(PLANET.x - ship.x) < hw + visibleRadius && Math.abs(PLANET.y - ship.y) < hh + visibleRadius) {
+    const px = screenX(PLANET.x), py = screenY(PLANET.y), r = PLANET.radius * scale;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(px, py, PLANET_INFLUENCE_RADIUS * scale, 0, TAU);
+    ctx.strokeStyle = '#91b8d044'; ctx.setLineDash([5 * D, 7 * D]); ctx.lineWidth = Math.max(1, D);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(px, py, ATMOSPHERE_RADIUS * scale, 0, TAU);
+    ctx.strokeStyle = '#ffb45a66'; ctx.setLineDash([3 * D, 4 * D]); ctx.stroke(); ctx.setLineDash([]);
+    const g = ctx.createRadialGradient(px - r * 0.35, py - r * 0.42, r * 0.08, px, py, r);
+    g.addColorStop(0, '#b5d889'); g.addColorStop(0.42, PLANET.color); g.addColorStop(1, '#17344a');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, r, 0, TAU); ctx.fill();
+    ctx.save(); ctx.beginPath(); ctx.arc(px, py, r, 0, TAU); ctx.clip();
+    ctx.fillStyle = '#60b7a080';
+    ctx.beginPath(); ctx.ellipse(px - r * 0.22, py - r * 0.08, r * 0.34, r * 0.19, -0.35, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(px + r * 0.37, py + r * 0.3, r * 0.22, r * 0.13, 0.4, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#d8cb9b70';
+    ctx.beginPath(); ctx.ellipse(px - r * 0.48, py + r * 0.38, r * 0.13, r * 0.08, -0.2, 0, TAU); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#c3e6a8'; ctx.lineWidth = Math.max(1, D);
+    ctx.beginPath(); ctx.arc(px, py, r, -2.5, -0.4); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawMinimap() {
+  if (!minimapCtx) return;
+  const c = minimapCtx, w = minimap.width, h = minimap.height;
+  c.clearRect(0, 0, w, h);
+  c.fillStyle = 'rgba(3,7,16,.92)'; c.fillRect(0, 0, w, h);
+  c.font = 'bold 20px system-ui,sans-serif'; c.fillStyle = '#d9e4ff'; c.textAlign = 'left';
+  c.fillText('RADAR · 5,000', 14, 25);
+  const cx = w / 2, cy = 122, radius = 78, unit = radius / MAP_RANGE;
+  c.strokeStyle = '#66728a88'; c.lineWidth = 1;
+  for (const fraction of [0.25, 0.5, 0.75, 1]) {
+    c.beginPath(); c.arc(cx, cy, radius * fraction, 0, TAU); c.stroke();
+  }
+  c.beginPath(); c.moveTo(cx - radius, cy); c.lineTo(cx + radius, cy); c.moveTo(cx, cy - radius); c.lineTo(cx, cy + radius); c.stroke();
+  const mapPoint = (x, y) => {
+    let dx = (x - ship.x) * unit, dy = (y - ship.y) * unit;
+    const len = Math.hypot(dx, dy);
+    if (len > radius) { dx *= radius / len; dy *= radius / len; }
+    return [cx + dx, cy + dy];
+  };
+  const pd = Math.hypot(PLANET.x - ship.x, PLANET.y - ship.y);
+  if (pd <= MAP_RANGE) {
+    const [px, py] = mapPoint(PLANET.x, PLANET.y);
+    c.beginPath(); c.arc(px, py, 5, 0, TAU); c.fillStyle = '#73c986'; c.fill();
+    c.beginPath(); c.arc(px, py, 8, 0, TAU); c.strokeStyle = '#a4dfa177'; c.stroke();
+  }
+  let eventSignal = false;
+  for (const r of rocks) {
+    if (!r.eventRock || Math.hypot(r.x - ship.x, r.y - ship.y) > MAP_RANGE) continue;
+    eventSignal = true;
+    const [sx, sy] = mapPoint(r.x, r.y);
+    const pulse = 4 + 2 * (0.5 + 0.5 * Math.sin(performance.now() / 180));
+    c.fillStyle = '#ffe070'; c.fillRect(sx - 3, sy - 3, 6, 6);
+    c.beginPath(); c.arc(sx, sy, pulse, 0, TAU); c.strokeStyle = '#ffe070bb'; c.stroke();
+  }
+  const heading = ship.a, tipX = cx + Math.cos(heading) * 8, tipY = cy + Math.sin(heading) * 8;
+  c.beginPath(); c.moveTo(tipX, tipY); c.lineTo(cx + Math.cos(heading + 2.45) * 7, cy + Math.sin(heading + 2.45) * 7);
+  c.lineTo(cx + Math.cos(heading - 2.45) * 7, cy + Math.sin(heading - 2.45) * 7); c.closePath();
+  c.fillStyle = '#fff1a8'; c.fill();
+  c.font = '16px system-ui,sans-serif'; c.textAlign = 'right';
+  c.fillStyle = eventSignal ? '#ffe070' : pd <= MAP_RANGE ? '#a4dfa1' : '#8994ad';
+  c.fillText(eventSignal ? 'UNKNOWN SIGNAL' : pd <= MAP_RANGE ? 'PLANET SIGNAL' : 'NO SIGNAL', w - 12, h - 8);
+}
+
+function drawRocks() {
+  const [hw, hh] = viewHalf();
+  for (const r of rocks) {
+    const dx = r.x - ship.x, dy = r.y - ship.y;
+    if (Math.abs(dx) > hw + 60 || Math.abs(dy) > hh + 60) continue;
+    const art = r.art, img = r.flash > 0 ? art.white : art.img;
+    const rockSize = D * r.shrink;
+    ctx.drawImage(img, screenX(r.x) - Math.round(art.center * rockSize), screenY(r.y) - Math.round(art.center * rockSize),
+      img.width * rockSize, img.height * rockSize);
+  }
+}
+
+// ろうそく型の炎。根元は細く、少し先でふくらみ、先端がとがる。
+// dir=-1 で機体の後ろへ、dir=1 で機首側へ伸びる。単位はドット
+function drawCandle(cx, cy, dirX, dirY, base, side, len, width, dir, sway) {
+  if (len < 0.8) return;
+  const reach = Math.ceil(base + len + Math.abs(side) + width + 2);
+  const px = -dirY, py = dirX; // 横方向
+  for (let gy = -reach; gy <= reach; gy++) for (let gx = -reach; gx <= reach; gx++) {
+    const along = dir * (gx * dirX + gy * dirY) - base; // 根元からの距離
+    if (along < -0.5 || along > len) continue;
+    const t = Math.max(0, along) / len;
+    const s = gx * px + gy * py - side - sway * t * t; // 先端ほど揺れる
+    // 根元→ふくらみ(30%)→先端の幅
+    const w = t < 0.3 ? width * (0.55 + 0.45 * Math.sin(t / 0.3 * Math.PI / 2))
+                      : width * Math.pow(1 - (t - 0.3) / 0.7, 1.15);
+    if (Math.abs(s) > w + 0.35) continue;
+    const inner = Math.abs(s) / (w + 0.35);
+    let col;
+    if (t < 0.55 && inner < 0.45) col = t < 0.25 ? '#fff0b0' : '#ffa040'; // 芯
+    else if (inner < 0.8 && t < 0.85) col = '#ff2a18';
+    else col = '#a80e0e';                                                  // 外側と先端
+    ctx.fillStyle = col;
+    ctx.fillRect(cx + gx * D, cy + gy * D, D, D);
+  }
+}
+
+function drawGuide(now) {
+  const alpha = Math.min(1, Math.max(0, 11 - now / 1000));
+  if (alpha <= 0) return;
+  const size = Math.max(13, Math.round(22 * scale));
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#6b7088';
+  ctx.font = `${size}px Consolas, "MS Gothic", monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('← → 旋回    ↑ 加速    ↓ 減速(逆噴射)    SHIFT ブースト    SPACE エネルギー砲', cw / 2, ch - size * 2);
+  ctx.globalAlpha = 1;
+}
+
+// オートバリア：自機のまわりにドットの輪。ぶつかった側ほど明るい
+function drawBarrier(cx, cy) {
+  if (ship.barrier <= 0) return;
+  const t = ship.barrier / 0.35;
+  const R = 11, n = 72;
+  for (let k = 0; k < n; k++) {
+    if (Math.random() > 0.35 + t * 0.65) continue; // 消えかけはまばらに
+    const ang = k / n * TAU;
+    let diff = Math.abs(ang - ship.barrierAng) % TAU;
+    if (diff > Math.PI) diff = TAU - diff;
+    ctx.fillStyle = diff < 0.6 ? '#ffffff' : diff < 1.6 ? '#7ffcff' : '#2a7cff';
+    ctx.fillRect(cx + Math.round(Math.cos(ang) * R) * D, cy + Math.round(Math.sin(ang) * R) * D, D, D);
+  }
+}
+
+function trackerFont() {
+  const size = Math.max(22, Math.round(36 * scale));
+  ctx.font = `bold ${size}px Consolas, "MS Gothic", monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  return size;
+}
+
+// 照準の枠：とらえている間だんだん縮まり、閉じると黄色になって記録
+function drawCapture(now) {
+  const r = capture.rock;
+  if (!r) return;
+  const p = Math.min(1, capture.t / CAPTURE_TIME);
+  const done = p >= 1;
+  if (!done && Math.floor(now / 100) % 4 === 0) return; // とらえ中は小さく点滅
+  const gap = Math.round(r.r / DOT + 2 + (1 - p) * 9);
+  const arm = 3;
+  const x = screenX(r.x), y = screenY(r.y);
+  ctx.fillStyle = done ? '#ffe070' : '#ffffff';
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
+    for (let k = 0; k < arm; k++) {
+      ctx.fillRect(x + (sx * gap - sx * k) * D, y + sy * gap * D, D, D);
+      ctx.fillRect(x + sx * gap * D, y + (sy * gap - sy * k) * D, D, D);
+    }
+  }
+}
+
+// 最速の岩が画面内にあるとき：岩の上に速度
+function drawTrackerLabel() {
+  const r = trackedRock;
+  if (!r) return;
+  const [hw, hh] = viewHalf();
+  if (Math.abs(r.x - ship.x) > hw || Math.abs(r.y - ship.y) > hh) return;
+  trackerFont();
+  ctx.fillStyle = '#ffe070';
+  ctx.fillText(String(Math.round(rockSpeed(r))), screenX(r.x), screenY(r.y - r.r) - 5 * D);
+  ctx.textBaseline = 'alphabetic';
+}
+
+// 画面外のとき：画面の端に、その方向を指す赤い矢印と速度
+function drawTrackerArrow() {
+  const r = trackedRock;
+  if (!r) return;
+  const [hw, hh] = viewHalf();
+  const dx = r.x - ship.x, dy = r.y - ship.y;
+  if (Math.abs(dx) <= hw && Math.abs(dy) <= hh) return;
+  const len = Math.hypot(dx, dy), ux = dx / len, uy = dy / len;
+  const nearDistance = Math.hypot(hw, hh);
+  const farDistance = Math.max(nearDistance + 1, Math.hypot(ROCK_AREA + 400, ROCK_AREA + 400));
+  const distanceT = Math.max(0, Math.min(1, (len - nearDistance) / (farDistance - nearDistance)));
+  const arrowScale = 2 - 1.9 * distanceT;
+  const arrowD = D * arrowScale;
+  const margin = 14 * D;
+  const t = Math.min((cw / 2 - margin) / Math.abs(ux || 1e-9), (ch / 2 - margin) / Math.abs(uy || 1e-9));
+  const ax = snap(cw / 2 + ux * t), ay = snap(ch / 2 + uy * t);
+  // ドットの矢印（三角の頭 ＋ 軸）
+  ctx.fillStyle = '#ff2a18';
+  for (let gy = -7; gy <= 7; gy++) for (let gx = -7; gx <= 7; gx++) {
+    const along = gx * ux + gy * uy, side = Math.abs(-gx * uy + gy * ux);
+    const head = along >= 0.5 && along <= 6 && side <= (6 - along) / 5.5 * 4;
+    const shaft = along >= -5 && along < 1 && side <= 1;
+    if (head || shaft) ctx.fillRect(ax + gx * arrowD, ay + gy * arrowD, arrowD, arrowD);
+  }
+  const fontSize = Math.max(1, Math.round(Math.max(22, Math.round(36 * scale)) * arrowScale));
+  ctx.font = `bold ${fontSize}px Consolas, "MS Gothic", monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ff6a5a';
+  ctx.fillText(String(Math.round(rockSpeed(r))), ax - ux * 13 * arrowD, ay - uy * 9 * arrowD);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawHud() {
+  const w = 180 * D, h = 5 * D;
+  const size = Math.max(14, Math.round(24 * scale)), big = Math.max(18, Math.round(40 * scale));
+  const top = Math.max(8, Math.round(24 * scale));
+  // 上から：スコア → エネルギーゲージ → 速度
+  const x = snap((cw - w) / 2), y = snap(top + big + Math.max(6, 10 * scale));
+  const ratio = ship.energy / ENERGY_MAX, trail = ship.energyTrail / ENERGY_MAX;
+  // 枠
+  ctx.fillStyle = '#2a2e3c';
+  ctx.fillRect(x - D, y - D, w + 2 * D, h + 2 * D);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x, y, w, h);
+  // 減った分（少しの間、赤く残る）
+  ctx.fillStyle = '#c02020';
+  ctx.fillRect(x, y, snap(w * trail), h);
+  // 残り
+  const low = ratio < 0.25;
+  ctx.fillStyle = ratio > 0.5 ? '#3cff6a' : !low ? '#ffd23c' : (performance.now() % 400 < 200 ? '#ff3c3c' : '#802020');
+  ctx.fillRect(x, y, snap(w * ratio), h);
+  // 目盛り（レトロな区切り）
+  ctx.fillStyle = '#000';
+  for (let s = 10; s < 150; s += 10) ctx.fillRect(x + s * D, y, Math.max(1, Math.floor(D / 2)), h);
+
+  ctx.font = `${size}px Consolas, "MS Gothic", monospace`;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#6b7088';
+  ctx.textAlign = 'right';
+  ctx.fillText('ENERGY', x - 4 * D, y + h / 2);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = low ? '#ff3c3c' : '#9aa3b5';
+  ctx.fillText(String(Math.floor(ship.energy)).padStart(4, ' '), x + w + 4 * D, y + h / 2);
+
+  // ゲージの上に横1列：HIGH SCORE ／ SCORE ／ SPEED
+  // SCORE は記録を更新すると少しの間黄色く点滅、SPEED は最高速度を超えている間オレンジ
+  const sp = Math.hypot(ship.vx, ship.vy);
+  labeledRow([
+    ['HIGH SCORE', String(Math.round(highScore)).padStart(5, '0'), '#ffe070'],
+    ['SCORE', String(Math.round(score)).padStart(5, '0'),
+      scoreFlash > 0 && performance.now() % 160 < 80 ? '#ffe070' : '#f2f2f2'],
+    ['SPEED', String(Math.round(sp)).padStart(4, '0'),
+      ship.boosting ? '#ff8a30' : sp > MAX_SPEED + 1 ? '#ffb070' : '#f2f2f2'],
+  ], top + big / 2, size, big);
+
+  // ゲージの下：ブーストの残り回数
+  const rowY = y + h + D + Math.max(6, 8 * scale) + size / 2;
+
+  // ゲージの右下：ブーストの残り回数。回復中の1つは下から少しずつたまる
+  const pip = 3 * D, gap = 2 * D;
+  let px = x + w - BOOST_CHARGES * (pip + gap) + gap;
+  const py = snap(rowY - pip / 2);
+  ctx.textAlign = 'right';
+  ctx.font = `${size}px Consolas, "MS Gothic", monospace`;
+  ctx.fillStyle = '#6b7088';
+  ctx.fillText('BOOST', px - 3 * D, rowY);
+  for (let i = 0; i < BOOST_CHARGES; i++, px += pip + gap) {
+    ctx.fillStyle = '#3a2418';
+    ctx.fillRect(px, py, pip, pip);
+    if (i < ship.boostCharges) {
+      ctx.fillStyle = ship.boosting && i === ship.boostCharges - 1 ? '#ffd0a0' : '#ff8a30';
+      ctx.fillRect(px, py, pip, pip);
+    } else if (i === ship.boostCharges) {
+      const f = snap(pip * ship.boostRecharge / BOOST_RECHARGE);
+      ctx.fillStyle = '#8a4a20';
+      ctx.fillRect(px, py + pip - f, pip, f);
+    }
+  }
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawBiomeLabel() {
+  const type = biomeAt(ship.x, ship.y);
+  const size = Math.max(12, Math.round(16 * scale));
+  ctx.font = `${size}px Consolas, "MS Gothic", monospace`;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = '#8994ad';
+  ctx.fillText(`BIOME · ${BIOME_NAMES[type]}`, 14 * D, 14 * D);
+  ctx.textBaseline = 'alphabetic';
+}
+
+// 「ラベル 数字」の組 [label, value, color] を横に並べ、全体を画面の中央にそろえて描く
+function labeledRow(items, cy, size, big) {
+  const labelFont = `${size}px Consolas, "MS Gothic", monospace`;
+  const valueFont = `bold ${big}px Consolas, "MS Gothic", monospace`;
+  const space = size * 0.6, gapBetween = big * 1.6;
+  const parts = items.map(([label, value, color]) => {
+    ctx.font = labelFont;
+    const lw = ctx.measureText(label).width;
+    ctx.font = valueFont;
+    return { label, value, color, lw, vw: ctx.measureText(value).width };
+  });
+  const total = parts.reduce((s, p) => s + p.lw + space + p.vw, 0) + gapBetween * (parts.length - 1);
+  let left = cw / 2 - total / 2;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  for (const p of parts) {
+    ctx.font = labelFont;
+    ctx.fillStyle = '#6b7088';
+    ctx.fillText(p.label, left, cy);
+    ctx.font = valueFont;
+    ctx.fillStyle = p.color;
+    ctx.fillText(p.value, left + p.lw + space, cy);
+    left += p.lw + space + p.vw + gapBetween;
+  }
+}
+
+function draw(now) {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cw, ch);
+  // 画面の揺れ（強い衝突ほど大きい）
+  const amp = ship.shake * ship.shake * 14 * scale;
+  ctx.save();
+  ctx.translate(snap((Math.random() * 2 - 1) * amp), snap((Math.random() * 2 - 1) * amp));
+  drawStars();
+  drawCelestialBodies();
+  drawRocks();
+  drawUfo(now);
+  drawBlasts();
+
+  for (const p of particles) {
+    const age = 1 - p.life / p.max;
+    ctx.fillStyle = p.colors[Math.min(p.colors.length - 1, Math.floor(age * p.colors.length))];
+    ctx.fillRect(screenX(p.x), screenY(p.y), D * p.size, D * p.size);
+  }
+
+  const a = heading(), dirX = Math.cos(a), dirY = Math.sin(a);
+  const cx = snap(cw / 2), cy = snap(ch / 2);
+
+  // 撃墜中は描かない。復活直後は点滅
+  const visible = ship.dead <= 0 && (ship.inv <= 0 || Math.floor(now / 80) % 2 === 0);
+  if (visible) {
+    const shipScale = ship.shrink;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.scale(shipScale, shipScale); ctx.translate(-cx, -cy);
+    const bf = ship.boostFlame; // ブースト中は炎が長く太くなる
+    drawCandle(cx, cy, dirX, dirY, 8, 0, ship.flame * 10 * ship.flick * (1 + 0.9 * bf),
+      2.4 * Math.min(1, ship.flame * 1.6) * (1 + 0.5 * bf), -1, ship.sway * ship.flame);
+    for (const side of [-4, 4]) {
+      drawCandle(cx, cy, dirX, dirY, 4, side, ship.revFlame * 4.5 * ship.flick, 1.1, 1, ship.sway * 0.4);
+    }
+    const i = ((Math.round(ship.a / (TAU / DIRECTIONS)) % DIRECTIONS) + DIRECTIONS) % DIRECTIONS;
+    ctx.drawImage(frames[i], cx - FRAME_C * D, cy - FRAME_C * D, FRAME * D, FRAME * D);
+    if (ship.flash > 0) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(cx + Math.round(dirX * 10) * D - D, cy + Math.round(dirY * 10) * D - D, D * 3, D * 3);
+    }
+    drawBarrier(cx, cy);
+    ctx.restore();
+  }
+
+  for (const b of bolts) {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(screenX(b.x), screenY(b.y), D, D);
+    for (let n = 1; n <= 2; n++) {
+      ctx.fillStyle = n < 3 ? '#7ffcff' : '#2a7cff';
+      ctx.fillRect(screenX(b.x - b.dirX * n * DOT), screenY(b.y - b.dirY * n * DOT), D, D);
+    }
+  }
+
+  drawCapture(now);
+  drawTrackerLabel();
+  ctx.restore();
+  drawTrackerArrow();
+  drawHud();
+  drawBiomeLabel();
+  drawMinimap();
+  if (ship.dead > 0 && Math.floor(now / 300) % 2 === 0) {
+    const size = Math.max(16, Math.round(40 * scale));
+    ctx.font = `bold ${size}px Consolas, "MS Gothic", monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff3c3c';
+    ctx.fillText('DESTROYED', cw / 2, ch / 2 - 30 * D);
+  }
+  drawGuide(now);
+}
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  pressed.clear();
+  draw(now);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
